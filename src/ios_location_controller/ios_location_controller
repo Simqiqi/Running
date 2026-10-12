@@ -1,0 +1,1266 @@
+from __future__ import annotations
+import asyncio
+from concurrent.futures import TimeoutError as FutureTimeout
+from dataclasses import asdict
+import json
+import threading
+from pathlib import Path
+from .connections import create_device
+from .android import discover as discover_android, pair
+from .gpx import Point
+from .motion import Motion, Settings, route_points
+
+
+class PlaybackController:
+    """Serialize all device I/O and state transitions on one owned event loop."""
+
+    def __init__(self, state_path: Path, device_factory=create_device):
+        self.path = state_path
+        self.factory = device_factory
+        self.points = []
+        self.name = ""
+        self.settings = Settings()
+        self.device = None
+        self.motion = None
+        self.current = None
+        self.state = "idle"
+        self.error = None
+        self.speed = 0
+        self.pending_time = 0.0
+        self.devices = []
+        self.discovery_error = None
+        self.udid = None
+        self.platform = "ios"
+        self.external_rsd = False
+        self.real_current = None
+        self.wda_error = None
+        self._load()
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.settings = Settings.parse(data["settings"])
+            if data.get("points"):
+                self.points = route_points(data["points"])
+                self.name = str(data.get("name", "Route"))[:120]
+        except Exception as exc:
+            self.error = f"Saved session could not be loaded: {exc}"
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_suffix(".tmp")
+        temp.write_text(json.dumps({"name": self.name, "points": self._coordinates(),
+                                    "settings": asdict(self.settings)}, ensure_ascii=False), encoding="utf-8")
+        temp.replace(self.path)
+
+    def _coordinates(self):
+        return [{"lat": p.latitude, "lng": p.longitude} for p in self.points]
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self.lock = asyncio.Lock()
+        self.last_tick = self.loop.time()
+        self.runner = self.loop.create_task(self._tick())
+        self.discovery = self.loop.create_task(self._discover())
+        self.loop.run_forever()
+
+    def call(self, action, data=None):
+        future = asyncio.run_coroutine_threadsafe(self._action(action, data or {}), self.loop)
+        try:
+            return future.result(timeout=40)
+        except FutureTimeout:
+            future.cancel()
+            raise ValueError("Device operation timed out; reconnect the device") from None
+
+    def status(self):
+        return self.call("status")
+
+    def _status(self):
+        return {"state": self.state, "connected": self.device is not None, "udid": self.udid,
+                "platform": self.platform,
+                "diagnostics": self.device.diagnostics() if self.device and hasattr(self.device, "diagnostics") else None,
+                "devices": self.devices, "discovery_error": self.discovery_error, "error": self.error,
+                "route": {"name": self.name, "points": self._coordinates()},
+                "real_current": self.real_current, "wda_error": self.wda_error,
+                "settings": asdict(self.settings), "current": self.current, "speed_kmh": self.speed,
+                "distance_m": self.motion.distance if self.motion else 0,
+                "elapsed_s": self.motion.elapsed if self.motion else 0,
+                "total_m": self.motion.total if self.motion else (Motion(self.points, self.settings).total if self.points else 0),
+                "laps": self.motion.laps if self.motion else 0}
+
+    async def _send(self, point, route=False):
+        sender = getattr(self.device, "set_route_point", self.device.set_point) if route else self.device.set_point
+        if await asyncio.wait_for(sender(point), 8) is False:
+            return
+        # Last successfully sent simulated coordinate, not a GPS readback.
+        self.current = {"lat": point.latitude, "lng": point.longitude}
+
+    async def _close_device(self):
+        device = self.device
+        if device:
+            await asyncio.wait_for(device.close(), 10)
+        self.device = None
+        self.udid = None
+        self.current = None
+        self.speed = 0
+
+    async def _action(self, action, data):
+        if action == "status":
+            return self._status()
+        async with self.lock:
+            try:
+                if action == "route":
+                    if self.state in ("playing", "paused"):
+                        raise ValueError("Stop playback before replacing the route")
+                    points = route_points(data.get("points"))
+                    self.points, self.name = points, str(data.get("name", "Route"))[:120]
+                    self.motion = None
+                    self._save()
+                    if self.device:
+                        await self._send(points[0])
+                    self.state = "ready" if self.device else "idle"
+                elif action == "clear-route":
+                    # Clear the simulated position before discarding the active route.
+                    if self.device:
+                        await asyncio.wait_for(self.device.clear(), 8)
+                    self.points = []
+                    self.name = ""
+                    self.motion = None
+                    self.current = None
+                    self.speed = 0
+                    self.pending_time = 0.0
+                    self.state = "ready" if self.device else "idle"
+                    self._save()
+                elif action == "settings":
+                    if self.state == "playing":
+                        raise ValueError("Pause before changing parameters")
+                    self.settings = Settings.parse(data)
+                    self.pending_time = 0.0
+                    self.last_tick = self.loop.time()
+                    self._save()
+                elif action == "pair":
+                    if self.device:
+                        raise ValueError("Disconnect before pairing another device")
+                    await pair(data.get("address"), data.get("code"))
+                elif action == "connect":
+                    if self.state in ("playing", "paused"):
+                        raise ValueError("Stop before changing the device")
+                    if not self.device:
+                        platform = data.get("platform", "ios")
+                        device = self.factory(platform=platform, udid=data.get("udid") or None,
+                                              rsd_host=data.get("rsd_host"), rsd_port=data.get("rsd_port"),
+                                              address=data.get("address"), android_options=data.get("android_options"))
+                        self.state = "connecting"
+                        self.platform = platform
+                        self.device = device
+                        try:
+                            await asyncio.wait_for(device.connect(), 25)
+                        except BaseException:
+                            # Keep the adapter if cleanup fails, so disconnect can retry.
+                            await asyncio.wait_for(device.close(), 8)
+                            self.device = None
+                            self.state = "error"
+                            raise
+                        self.device = device
+                        self.platform = platform
+                        self.external_rsd = bool(data.get("rsd_host"))
+                        self.udid = getattr(device, "udid", None) or data.get("udid")
+                        try:
+                            self.real_current = await device.read_location()
+                            self.wda_error = None
+                        except Exception as exc:
+                            self.real_current = None
+                            self.wda_error = str(exc) or type(exc).__name__
+                    if self.points:
+                        await self._send(self.points[0])
+                    self.state = "ready"
+                elif action == "start":
+                    if not self.device or not self.points:
+                        raise ValueError("Connect a phone and import a route first")
+                    if self.state != "playing":
+                        if self.state != "paused":
+                            self.motion = Motion(self.points, self.settings)
+                            await self._send(self.points[0])
+                        self.state = "playing"
+                        self.pending_time = 0.0
+                        self.last_tick = self.loop.time()
+                elif action == "position":
+                    if self.state == "playing":
+                        raise ValueError("Pause or stop playback before switching location")
+                    if not self.device:
+                        raise ValueError("Connect a phone first")
+                    lat, lng = float(data.get("lat")), float(data.get("lng"))
+                    if not -85 <= lat <= 85 or not -180 <= lng <= 180:
+                        raise ValueError("Invalid coordinates")
+                    await self._send(Point(lat, lng))
+                    self.state = "ready"
+                elif action == "pause":
+                    if self.state == "playing":
+                        self.state = "paused"
+                        self.speed = 0
+                elif action == "stop":
+                    self.state = "ready" if self.device else "idle"
+                    self.motion = None
+                    self.speed = 0
+                    if self.device:
+                        await asyncio.wait_for(self.device.clear(), 8)
+                    self.current = None
+                elif action == "disconnect":
+                    self.state = "idle"
+                    await self._close_device()
+                    self.motion = None
+                    self.real_current = None
+                    self.wda_error = None
+                else:
+                    raise ValueError("Unknown action")
+                self.error = None
+            except BaseException as exc:
+                self.error = str(exc) or type(exc).__name__
+                if not isinstance(exc, ValueError):
+                    self.state = "error"
+                raise
+            return self._status()
+
+    async def _tick(self):
+        while True:
+            await asyncio.sleep(.02)
+            async with self.lock:
+                now = self.loop.time()
+                delta, self.last_tick = now - self.last_tick, now
+                if self.state != "playing":
+                    self.pending_time = 0.0
+                    continue
+                self.pending_time += delta
+                interval = self.settings.interval
+                if self.pending_time + 1e-9 < interval:
+                    continue
+                # No burst catch-up after a slow device write or suspended computer.
+                dt = min(self.pending_time, interval * 2)
+                self.pending_time = 0.0
+                try:
+                    point, speed, done = self.motion.advance(dt, self.settings)
+                    await self._send(point, route=not done)
+                    self.speed = 0 if done else speed
+                    if done:
+                        self.state = "completed"
+                except Exception as exc:
+                    self.state, self.error = "error", str(exc) or type(exc).__name__
+                    try:
+                        await self._close_device()
+                    except Exception:
+                        pass
+
+    async def _discover(self):
+        while True:
+            devices, errors = [], []
+            try:
+                from pymobiledevice3.usbmux import list_devices
+                found = await asyncio.wait_for(list_devices(), 5)
+                devices.extend({"udid": str(d.serial), "platform": "ios", "type": str(d.connection_type)} for d in found)
+            except Exception as exc:
+                errors.append("iOS: " + (str(exc) or type(exc).__name__))
+            try:
+                devices.extend(await asyncio.wait_for(discover_android(), 5))
+            except Exception as exc:
+                errors.append("Android: " + (str(exc) or type(exc).__name__))
+            self.devices = devices
+            self.discovery_error = "; ".join(errors) or None
+            # Discovery is advisory: external RSD/Wi-Fi devices may not be in usbmux.
+            # Actual device writes detect transport failure without false disconnects.
+            await asyncio.sleep(3)
+
+    def close(self):
+        async def shutdown():
+            self.runner.cancel()
+            self.discovery.cancel()
+            await asyncio.gather(self.runner, self.discovery, return_exceptions=True)
+            await self._close_device()
+        future = asyncio.run_coroutine_threadsafe(shutdown(), self.loop)
+        try:
+            future.result(timeout=15)
+        finally:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.thread.join(timeout=2)
+
+"""ADB transport for Android's system test providers (no root or APK)."""
+import asyncio
+import ipaddress
+import math
+import os
+import re
+import shutil
+import subprocess
+import time
+from dataclasses import asdict, dataclass
+
+from .device import LocationDevice
+
+
+@dataclass(frozen=True)
+class AndroidOptions:
+    """Explicit test conditions, not a model of real radio or sensor readings."""
+
+    provider: str = "gps"
+    gps_accuracy: float = 5.0
+    network_accuracy: float = 50.0
+    network_interval: float = 5.0
+
+    @classmethod
+    def parse(cls, value=None):
+        if value is None:
+            return cls()
+        if not isinstance(value, dict) or value.keys() - cls.__dataclass_fields__.keys():
+            raise ValueError("Invalid Android test options")
+        options = asdict(cls()) | value
+        if options["provider"] not in ("gps", "network", "both"):
+            raise ValueError("Android provider must be gps, network or both")
+        for name, maximum in (("gps_accuracy", 10000), ("network_accuracy", 10000),
+                              ("network_interval", 60)):
+            number = options[name]
+            if isinstance(number, bool) or not isinstance(number, (int, float)):
+                raise ValueError(f"{name} must be a number")
+            try:
+                number = float(number)
+            except OverflowError:
+                raise ValueError(f"{name} is out of range") from None
+            if not math.isfinite(number) or not 0.1 <= number <= maximum:
+                raise ValueError(f"{name} must be between 0.1 and {maximum}")
+            options[name] = number
+        return cls(**options)
+
+
+def endpoint(value):
+    if not isinstance(value, str):
+        raise ValueError("Expected an IP address and port")
+    host, sep, port = value.rpartition(":")
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+        if not sep or not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise ValueError()
+        if address.is_unspecified or address.is_multicast:
+            raise ValueError()
+    except ValueError:
+        raise ValueError("Expected IP:port (IPv6: [address]:port)") from None
+    return f"[{address}]:{int(port)}" if address.version == 6 else f"{address}:{int(port)}"
+
+
+async def adb(*args, input_text=None):
+    executable = os.environ.get("ADB_PATH") or shutil.which("adb")
+    if not executable:
+        raise RuntimeError("Android requires Android SDK Platform-Tools: adb on PATH or ADB_PATH")
+    process = await asyncio.create_subprocess_exec(
+        executable, *args, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        out, err = await asyncio.wait_for(
+            process.communicate(input_text.encode() if input_text else None), 15)
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+        raise
+    text = (out + err).decode("utf-8", errors="replace").strip()
+    # Android's default shell help handler returns -1 (usually 255 via adb)
+    # even after successfully printing help. Only accept that result for this
+    # read-only probe, with a recognizable help header and no stderr output.
+    normal_location_help = (
+        len(args) == 6
+        and args[0] == "-s"
+        and args[2:] == ("shell", "cmd", "location", "help")
+        and process.returncode in (-1, 255)
+        and not err.strip()
+        and re.search(r"(?m)^Location service commands:[ \t]*\r?$",
+                      out.decode("utf-8", errors="replace")) is not None
+    )
+    if (process.returncode and not normal_location_help) or any(s in text.lower() for s in
+            ("error:", "exception", "failed", "cannot connect", "unknown command")):
+        # Pairing codes must not be reflected into status or logs.
+        raise RuntimeError("ADB pairing failed" if input_text else text[:500] or "ADB command failed")
+    return text
+
+
+async def discover():
+    output = await adb("devices", "-l")
+    return [{"udid": row[0], "platform": "android", "type": "ADB / " + row[1]}
+            for line in output.splitlines()
+            if len(row := line.split()) >= 2 and row[1] in ("device", "offline", "unauthorized")]
+
+
+async def pair(address, code):
+    if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code):
+        raise ValueError("Pairing code must contain six digits")
+    await adb("pair", endpoint(address), input_text=code + "\n")
+
+
+class AndroidDevice(LocationDevice):
+    # Reuse the CLI route player; all actual device I/O is overridden here.
+    def __init__(self, udid=None, address=None, options=None):
+        self.udid = udid
+        self.address = endpoint(address) if address else None
+        self.providers = []
+        self.original_mode = None
+        self.options = AndroidOptions.parse(options)
+        self.last_updates = {}
+        self.injections = {}
+
+    def diagnostics(self):
+        return {"horizontal_accuracy": True, "sensors": False, "raw_gnss": False,
+                "mock": True, "options": asdict(self.options),
+                "injections": {name: dict(value) for name, value in self.injections.items()}}
+
+    async def shell(self, *args):
+        if not self.udid:
+            raise RuntimeError("No Android device selected")
+        return await adb("-s", self.udid, "shell", *args)
+
+    async def connect(self):
+        if self.address:
+            await adb("connect", self.address)
+            self.udid = self.address
+        if not self.udid:
+            devices = [d for d in await discover() if d["type"] == "ADB / device"]
+            if len(devices) != 1:
+                raise ValueError("Select exactly one authorized Android device")
+            self.udid = devices[0]["udid"]
+        if await adb("-s", self.udid, "get-state") != "device":
+            raise RuntimeError("Android device is offline or unauthorized")
+        help_text = await self.shell("cmd", "location", "help")
+        if "set-test-provider-location" not in help_text:
+            raise RuntimeError("This Android ROM lacks ADB test-provider support (use Android 12+)")
+        if await self.shell("cmd", "location", "is-location-enabled") != "true":
+            raise RuntimeError("Android system location is disabled")
+        mode = await self.shell("appops", "get", "com.android.shell", "android:mock_location")
+        match = re.search(r"(?:MOCK_LOCATION|mock_location):\s*(allow|ignore|deny|default|foreground)", mode)
+        if not match and "No operations" not in mode:
+            raise RuntimeError("Cannot determine original mock-location permission")
+        self.original_mode = match[1] if match else "default"
+        await self.shell("appops", "set", "com.android.shell", "android:mock_location", "allow")
+
+    async def set_route_point(self, point):
+        return await self.set_point(point, force=False)
+
+    async def set_point(self, point, force=True):
+        lat, lon = point.latitude, point.longitude
+        if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+            raise ValueError("Invalid coordinates")
+        if self.original_mode is None:
+            raise RuntimeError("Android is not connected")
+        now = time.monotonic()
+        selected = ("gps", "network") if self.options.provider == "both" else (self.options.provider,)
+        sent = False
+        for provider in selected:
+            # The network test source has its own cadence; never backfill missed updates.
+            if (not force and provider == "network" and provider in self.last_updates
+                    and now - self.last_updates[provider] < self.options.network_interval):
+                continue
+            if provider not in self.providers:
+                await self.shell("cmd", "location", "providers", "add-test-provider", provider)
+                self.providers.append(provider)
+                await self.shell("cmd", "location", "providers", "set-test-provider-enabled", provider, "true")
+            accuracy = getattr(self.options, provider + "_accuracy")
+            await self.shell("cmd", "location", "providers", "set-test-provider-location", provider,
+                             "--location", f"{lat:.8f},{lon:.8f}", "--accuracy", str(accuracy))
+            self.last_updates[provider] = time.monotonic()
+            self.injections[provider] = {"lat": lat, "lng": lon, "accuracy_m": accuracy}
+            sent = True
+        return sent
+
+    async def clear(self, existing=False):
+        if existing:
+            # Explicit CLI recovery also clears providers left by a previous run.
+            self.providers = list(dict.fromkeys(self.providers + ["gps", "network"]))
+        errors = []
+        for provider in list(self.providers):
+            try:
+                await self.shell("cmd", "location", "providers", "remove-test-provider", provider)
+                self.providers.remove(provider)
+                self.last_updates.pop(provider, None)
+                self.injections.pop(provider, None)
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError("Android cleanup failed; reconnect to restore location: " + "; ".join(errors))
+
+    async def close(self):
+        await self.clear()
+        if self.original_mode is not None:
+            await self.shell("appops", "set", "com.android.shell", "android:mock_location", self.original_mode)
+            self.original_mode = None
+
+    async def read_location(self):
+        raise RuntimeError("Android displays sent coordinates only, not real GPS readback")
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+import asyncio
+import math
+import random
+import time
+import json
+import subprocess
+import urllib.request
+import sys
+from contextlib import AsyncExitStack
+from collections.abc import Awaitable, Callable
+
+from .gpx import Point, bearing_radians, distance_meters, interpolate, offset_point
+
+log = logging.getLogger(__name__)
+
+
+class LocationDevice:
+    """Adapter around pymobiledevice3's DVT location service."""
+
+    def diagnostics(self):
+        return {"horizontal_accuracy": False, "sensors": False, "raw_gnss": False,
+                "mock": None, "injections": {}}
+
+    async def set_route_point(self, point):
+        return await self.set_point(point)
+
+    def __init__(self, udid: str | None = None, rsd_host: str | None = None, rsd_port: int | None = None) -> None:
+        self.udid = udid
+        self.rsd_host = rsd_host
+        self.rsd_port = rsd_port
+        self._simulation = None
+        self._provider = None
+        self._transport = None
+        self._tunnel = None
+        self._resources = None
+        self._wda_process = None
+        self.wda_error = None
+
+    async def connect(self) -> None:
+        if (self.rsd_host is None) != (self.rsd_port is None):
+            raise ValueError("RSD host and port must be provided together")
+        from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
+
+        from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
+        resources = AsyncExitStack()
+        try:
+            if self.rsd_host is not None:
+                from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+                transport = RemoteServiceDiscoveryService((self.rsd_host, self.rsd_port))
+                resources.push_async_callback(transport.close)
+                await transport.connect()
+                mode = "external RSD"
+            else:
+                from pymobiledevice3.lockdown import create_using_usbmux
+                lockdown = await create_using_usbmux(self.udid)
+                if int(lockdown.product_version.split('.')[0]) < 17:
+                    transport = lockdown
+                    resources.push_async_callback(lockdown.close)
+                    mode = "USB lockdown"
+                else:
+                    await lockdown.close()
+                    from pymobiledevice3.remote.rsd_tunnel import PreferredRsdTunnel
+                    tunnel = PreferredRsdTunnel(serial=self.udid)
+                    resources.push_async_callback(tunnel.aclose)
+                    transport = await tunnel.aopen()
+                    mode = "userspace RSD"
+            provider = await resources.enter_async_context(DvtProvider(transport))
+            self._simulation = await resources.enter_async_context(LocationSimulation(provider))
+            self._resources = resources
+        except BaseException:
+            await resources.aclose()
+            self._simulation = None
+            raise
+        log.info("Connected to iPhone (%s)", mode)
+
+        if self.rsd_host is not None:
+            self.wda_error = "External RSD: real GPS readback is unavailable"
+            return
+
+        # WDA is optional: the DVT simulation path must remain usable when it is absent.
+        try:
+            self._wda_process = subprocess.Popen(
+                [sys.executable, "-m", "pymobiledevice3", "usbmux", "forward", "8100", "8100",
+                 "--serial", self.udid or ""],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            await asyncio.sleep(0.25)
+            await self.read_location()
+        except Exception as exc:
+            self.wda_error = str(exc) or type(exc).__name__
+            self._stop_wda()
+
+    async def read_location(self) -> dict:
+        if self.rsd_host is not None:
+            raise RuntimeError("External RSD: real GPS readback is unavailable")
+        def request():
+            with urllib.request.urlopen("http://127.0.0.1:8100/wda/device/location", timeout=3) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            value = data.get("value", data)
+            if "latitude" not in value or "longitude" not in value:
+                raise RuntimeError(value.get("message", "WDA returned no location"))
+            return {"lat": float(value["latitude"]), "lng": float(value["longitude"]),
+                    "altitude": float(value.get("altitude", 0))}
+        return await asyncio.to_thread(request)
+
+    def _stop_wda(self):
+        if self._wda_process and self._wda_process.poll() is None:
+            self._wda_process.terminate()
+        self._wda_process = None
+
+    async def set_point(self, point: Point) -> None:
+        if self._simulation is None:
+            raise RuntimeError("Device is not connected")
+        await self._simulation.set(point.latitude, point.longitude)
+
+    async def play(
+        self,
+        points: Sequence[Point],
+        interval: float,
+        loop: bool = False,
+        speed_kmh: float | None = None,
+        speed_variation_pct: float = 0.0,
+        lateral_variation_m: float = 0.0,
+        random_seed: int | None = None,
+        on_point: Callable[[Point], Awaitable[None]] | None = None,
+        pause_event: asyncio.Event | None = None,
+    ) -> None:
+        if not points or interval <= 0:
+            raise ValueError("Route must contain points and interval must be positive")
+        if speed_kmh is not None and speed_kmh <= 0:
+            raise ValueError("Speed must be positive")
+        if not 0 <= speed_variation_pct <= 100:
+            raise ValueError("Speed variation must be between 0 and 100 percent")
+        if lateral_variation_m < 0:
+            raise ValueError("Lateral variation must not be negative")
+        rng = random.Random(random_seed)
+        while True:
+            if pause_event is not None:
+                await pause_event.wait()
+            await self.set_point(points[0])
+            if on_point is not None:
+                await on_point(points[0])
+            for segment, (start, end) in enumerate(zip(points, points[1:]), 1):
+                if speed_kmh is None:
+                    if pause_event is not None:
+                        await pause_event.wait()
+                    sender = self.set_point if segment == len(points) - 1 else self.set_route_point
+                    sent = await sender(end)
+                    if on_point is not None and sent is not False:
+                        await on_point(end)
+                    await asyncio.sleep(interval)
+                    continue
+                segment_distance = distance_meters(start, end)
+                variation = speed_variation_pct / 100
+                segment_speed = speed_kmh * rng.uniform(max(0.01, 1 - variation), 1 + variation)
+                duration = segment_distance / (segment_speed / 3.6)
+                steps = max(1, math.ceil(duration / interval))
+                started = time.monotonic()
+                bearing = bearing_radians(start, end)
+                lateral = rng.uniform(-lateral_variation_m, lateral_variation_m)
+                for step in range(1, steps + 1):
+                    if pause_event is not None:
+                        await pause_event.wait()
+                    fraction = step / steps
+                    point = interpolate(start, end, fraction)
+                    sway = lateral * math.sin(math.pi * fraction)
+                    point = offset_point(point, -math.sin(bearing) * sway, math.cos(bearing) * sway)
+                    sender = self.set_point if segment == len(points) - 1 and step == steps else self.set_route_point
+                    sent = await sender(point)
+                    if on_point is not None and sent is not False:
+                        await on_point(point)
+                    target = started + duration * step / steps
+                    await asyncio.sleep(max(0.0, target - time.monotonic()))
+                log.debug("Segment %.1f m at %.2f km/h completed in %.2f s", segment_distance, segment_speed, duration)
+            if not loop:
+                return
+
+    async def clear(self) -> None:
+        if self._simulation is not None:
+            await self._simulation.clear()
+
+    async def close(self) -> None:
+        try:
+            if self._simulation is not None:
+                await self._simulation.clear()
+        finally:
+            self._simulation = None
+            resources, self._resources = self._resources, None
+            if resources is not None:
+                await resources.aclose()
+            self._stop_wda()
+
+from __future__ import annotations
+import argparse
+import asyncio
+import logging
+import math
+from pathlib import Path
+from .connections import create_device
+from .android import discover as discover_android, pair
+from .gpx import load_points
+
+
+def positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return number
+
+
+def percentage(value: str) -> float:
+    number = float(value)
+    if not 0 <= number <= 100:
+        raise argparse.ArgumentTypeError("must be between 0 and 100")
+    return number
+
+
+def nonnegative_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return number
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="iOS / Android location test controller")
+    sub = parser.add_subparsers(dest="command", required=True)
+    listing = sub.add_parser("list")
+    listing.add_argument("--platform", choices=["ios", "android"], default="ios")
+    pairing = sub.add_parser("pair", help="Pair Android wireless debugging (code prompted securely)")
+    pairing.add_argument("address", help="Pairing IP:port, not the debugging port")
+    validate = sub.add_parser("validate")
+    validate.add_argument("route", type=Path)
+    emulator = sub.add_parser("emulator", help="Explicit Android AVD test inputs (not physical phones)")
+    emulator.add_argument("--serial", required=True, help="Running AVD serial, e.g. emulator-5554")
+    emu_commands = emulator.add_subparsers(dest="emulator_command", required=True)
+    fix = emu_commands.add_parser("fix", help="GPS fix with a satellite-count test parameter, not raw GNSS")
+    fix.add_argument("--latitude", type=float, required=True)
+    fix.add_argument("--longitude", type=float, required=True)
+    fix.add_argument("--altitude", type=float, default=0)
+    fix.add_argument("--satellites", type=int, default=8)
+    fix.add_argument("--speed-kmh", type=nonnegative_float, default=0)
+    sensor = emu_commands.add_parser("sensor", help="Temporary sensor values, restored after duration")
+    from .emulator import SENSORS
+    sensor.add_argument("name", choices=SENSORS)
+    for axis in ("x", "y", "z"):
+        sensor.add_argument("--" + axis, type=float, required=True)
+    sensor.add_argument("--duration", type=positive_float, default=1)
+    play = sub.add_parser("play")
+    play.add_argument("route", type=Path)
+    play.add_argument("--udid")
+    play.add_argument("--interval", type=positive_float, default=1.0, help="GPS update interval in seconds")
+    play.add_argument("--speed-kmh", type=positive_float, help="Travel speed along the route in km/h")
+    play.add_argument("--speed-variation-pct", type=percentage, default=0.0, help="Random speed variation per segment")
+    play.add_argument("--lateral-variation-m", type=nonnegative_float, default=0.0, help="Left/right sway amplitude in meters")
+    play.add_argument("--random-seed", type=int, help="Optional seed for repeatable movement variation")
+    play.add_argument("--loop", action="store_true")
+    play.add_argument("--android-provider", choices=["gps", "network", "both"], default="gps")
+    play.add_argument("--gps-accuracy", type=positive_float, default=5.0, help="Android test hAcc in meters")
+    play.add_argument("--network-accuracy", type=positive_float, default=50.0, help="Android network test hAcc in meters")
+    play.add_argument("--network-interval", type=positive_float, default=5.0, help="Android network test update interval")
+    play.add_argument("--rsd-host", help="RSD host printed by pymobiledevice3 remote start-tunnel")
+    play.add_argument("--rsd-port", type=int, help="RSD port printed by pymobiledevice3 remote start-tunnel")
+    clear = sub.add_parser("clear")
+    clear.add_argument("--udid")
+    clear.add_argument("--rsd-host")
+    clear.add_argument("--rsd-port", type=int)
+    for command in (play, clear):
+        command.add_argument("--platform", choices=["ios", "android"], default="ios")
+        command.add_argument("--address", help="Android wireless debugging IP:port")
+    web = sub.add_parser("map", help="Start the local OpenStreetMap route editor")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8765)
+    return parser
+
+async def run(args: argparse.Namespace) -> None:
+    if args.command == "emulator":
+        from .emulator import Emulator
+        emulator = Emulator(args.serial)
+        if args.emulator_command == "fix":
+            await emulator.fix(args.latitude, args.longitude, args.altitude, args.satellites, args.speed_kmh)
+            print("AVD GPS fix sent (satellite count is a test input, not raw GNSS; mock status is unchanged)")
+        else:
+            await emulator.sensor(args.name, args.x, args.y, args.z, args.duration)
+            print("AVD sensor test completed; original sensor values restored")
+        return
+    if args.command == "list":
+        if args.platform == "android":
+            for device in await discover_android():
+                print(device)
+            return
+        from pymobiledevice3.usbmux import list_devices
+        for device in await list_devices():
+            print(device)
+        return
+    if args.command == "pair":
+        from getpass import getpass
+        await pair(args.address, getpass("Android pairing code: "))
+        print("Paired successfully")
+        return
+    if args.command == "validate":
+        print(f"valid: {len(load_points(args.route))} points")
+        return
+    if args.command == "map":
+        from .web import serve
+        serve(args.host, args.port)
+        return
+    rsd_host = getattr(args, "rsd_host", None)
+    rsd_port = getattr(args, "rsd_port", None)
+    if (rsd_host is None) != (rsd_port is None):
+        raise ValueError("--rsd-host and --rsd-port must be used together")
+    options = None
+    if args.platform == "android" and args.command == "play":
+        options = {"provider": args.android_provider, "gps_accuracy": args.gps_accuracy,
+                   "network_accuracy": args.network_accuracy, "network_interval": args.network_interval}
+    device = create_device(args.platform, getattr(args, "udid", None), rsd_host, rsd_port,
+                           args.address, android_options=options)
+    try:
+        await device.connect()
+        if args.command == "clear":
+            if args.platform == "android":
+                await device.clear(existing=True)
+            else:
+                await device.clear()
+        else:
+            await device.play(
+                load_points(args.route),
+                args.interval,
+                args.loop,
+                args.speed_kmh,
+                args.speed_variation_pct,
+                args.lateral_variation_m,
+                args.random_seed,
+            )
+    finally:
+        await device.close()
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        asyncio.run(run(build_parser().parse_args()))
+    except KeyboardInterrupt:
+        print("\nStopped; cleanup was attempted.")
+
+if __name__ == "__main__":
+    main()
+
+"""Loopback-only UI server. Editing routes never starts device playback."""
+import json
+import mimetypes
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from .motion import route_points
+from .playback import PlaybackController
+
+STATIC = Path(__file__).parent / "static"
+
+
+def parse_gpx(text):
+    if not isinstance(text, str) or len(text) > 2_000_000:
+        raise ValueError("GPX exceeds 2 MB")
+    if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
+        raise ValueError("XML entities are not supported")
+    root = ET.fromstring(text)
+    nodes = [n for n in root.iter() if n.tag.split("}")[-1] == "trkpt"]
+    if not nodes:
+        nodes = [n for n in root.iter() if n.tag.split("}")[-1] == "rtept"]
+    points = [{"lat": float(n.attrib["lat"]), "lng": float(n.attrib["lon"])} for n in nodes]
+    route_points(points)
+    return points
+
+
+class Handler(BaseHTTPRequestHandler):
+    def host_allowed(self):
+        host = self.headers.get("Host", "").partition(":")[0].lower()
+        return host in ("localhost", "127.0.0.1")
+
+    def send_data(self, body, content_type, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def json(self, data, code=200):
+        self.send_data(json.dumps(data, ensure_ascii=False, allow_nan=False).encode(), "application/json; charset=utf-8", code)
+
+    def do_GET(self):
+        if not self.host_allowed():
+            self.json({"error": "Host denied"}, 403)
+            return
+        path = urlparse(self.path).path
+        try:
+            if path == "/api/status":
+                self.json(self.server.controller.status())
+                return
+            if path == "/api/health":
+                self.json({"app": "ios-location-controller", "version": "2.0"})
+                return
+            name = "index.html" if path == "/" else path.removeprefix("/static/")
+            target = (STATIC / name).resolve()
+            if (path != "/" and not path.startswith("/static/")) or not target.is_relative_to(STATIC.resolve()) or not target.is_file():
+                self.json({"error": "Not found"}, 404)
+                return
+            mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            if target.suffix in (".js", ".css", ".html"):
+                mime += "; charset=utf-8"
+            self.send_data(target.read_bytes(), mime)
+        except Exception as exc:
+            self.json({"error": str(exc) or type(exc).__name__}, 500)
+
+    def do_POST(self):
+        try:
+            # Reject cross-site browser requests; this service controls a local device.
+            origin = self.headers.get("Origin")
+            if not self.host_allowed():
+                self.json({"error": "Host denied"}, 403)
+                return
+            if origin and origin != "http://" + self.headers.get("Host", ""):
+                self.json({"error": "Origin denied"}, 403)
+                return
+            if self.headers.get_content_type() != "application/json":
+                raise ValueError("Content-Type must be application/json")
+            length = int(self.headers.get("Content-Length", 0))
+            if not 0 < length <= 2_500_000:
+                raise ValueError("Request must be between 1 byte and 2.5 MB")
+            data = json.loads(self.rfile.read(length))
+            if not isinstance(data, dict):
+                raise ValueError("Request must be a JSON object")
+            action = urlparse(self.path).path.removeprefix("/api/")
+            if action == "import":
+                self.json({"points": parse_gpx(data.get("gpx")), "name": str(data.get("name", "Route"))[:120]})
+            elif action == "search":
+                query = str(data.get("query", "")).strip()
+                if not query or len(query) > 200:
+                    raise ValueError("请输入有效地点")
+                params = urlencode({"q": query, "format": "jsonv2", "limit": 5, "addressdetails": 1})
+                request = Request("https://nominatim.openstreetmap.org/search?" + params,
+                                  headers={"User-Agent": "RouteStudio/2.0 local location test tool"})
+                with urlopen(request, timeout=10) as response:
+                    results = json.loads(response.read(1_000_000).decode("utf-8"))
+                self.json({"results": [{"name": str(item.get("display_name", ""))[:300],
+                                         "lat": float(item["lat"]), "lng": float(item["lon"])}
+                                        for item in results]})
+            elif action in {"route", "clear-route", "settings", "connect", "pair", "disconnect", "start", "pause", "stop", "position"}:
+                self.json(self.server.controller.call(action, data))
+            else:
+                self.json({"error": "Not found"}, 404)
+        except Exception as exc:
+            self.json({"error": str(exc) or type(exc).__name__}, 400)
+
+    def log_message(self, format, *args):
+        if "/api/status" not in str(args):
+            super().log_message(format, *args)
+
+
+def serve(host="127.0.0.1", port=8765):
+    if host not in ("127.0.0.1", "localhost"):
+        raise ValueError("This device controller only listens on localhost")
+    server = ThreadingHTTPServer((host, port), Handler)
+    path = Path(os.environ.get("IOS_LOCATION_STATE", Path.home() / ".ios-location-controller" / "session.json"))
+    server.controller = PlaybackController(path)
+    print(f"iOS Location Controller 2.0: http://{host}:{port}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.controller.close()
+        server.server_close()
+
+
+def main():
+    serve()
+
+
+if __name__ == "__main__":
+    main()
+
+"""Transparent Android AVD test inputs; never used by physical-device playback."""
+import asyncio
+import math
+import re
+
+from .android import adb
+
+
+SENSORS = ("acceleration", "gyroscope", "magnetic-field")
+
+
+def number(value, name, minimum, maximum):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    try:
+        value = float(value)
+    except OverflowError:
+        raise ValueError(f"{name} is out of range") from None
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+class Emulator:
+    def __init__(self, serial):
+        if not isinstance(serial, str) or not re.fullmatch(r"emulator-[0-9]{1,5}", serial):
+            raise ValueError("An explicit Android AVD serial (emulator-PORT) is required")
+        port = int(serial.split("-")[1])
+        if not 1 <= port <= 65535:
+            raise ValueError("Invalid emulator port")
+        self.serial = serial
+
+    async def command(self, *args):
+        output = await adb("-s", self.serial, "emu", *args)
+        if any(line.lstrip().startswith("KO") for line in output.splitlines()):
+            raise RuntimeError("Android emulator rejected the command: " + output[:500])
+        return output
+
+    async def connect(self):
+        if await adb("-s", self.serial, "get-state") != "device":
+            raise RuntimeError("Android emulator is offline or unauthorized")
+        # Verify the console really belongs to a running AVD, not just a matching serial.
+        output = await self.command("avd", "name")
+        names = [line.strip() for line in output.splitlines() if line.strip() not in ("", "OK")]
+        if not names:
+            raise RuntimeError("Cannot verify the Android AVD")
+
+    async def fix(self, latitude, longitude, altitude=0, satellites=8, speed_kmh=0):
+        lat = number(latitude, "latitude", -90, 90)
+        lon = number(longitude, "longitude", -180, 180)
+        altitude = number(altitude, "altitude", -1000, 100000)
+        speed = number(speed_kmh, "speed_kmh", 0, 300)
+        if isinstance(satellites, bool) or not isinstance(satellites, int) or not 1 <= satellites <= 12:
+            raise ValueError("satellites must be an integer between 1 and 12")
+        await self.connect()
+        # The console uses longitude first and velocity in knots, not km/h.
+        await self.command("geo", "fix", str(lon), str(lat), str(altitude),
+                           str(satellites), str(speed / 1.852))
+
+    async def sensor(self, name, x, y, z, duration=1):
+        if name not in SENSORS:
+            raise ValueError("Unsupported emulator sensor")
+        values = [number(v, "sensor value", -100000, 100000) for v in (x, y, z)]
+        duration = number(duration, "duration", 0.1, 60)
+        await self.connect()
+        output = await self.command("sensor", "get", name)
+        match = re.search(r"^" + re.escape(name) + r"\s*=\s*([^\r\n]+)", output, re.MULTILINE)
+        if not match:
+            raise RuntimeError("Cannot read the original emulator sensor value; no injection performed")
+        components = match[1].strip().split(":")
+        try:
+            if len(components) != 3:
+                raise ValueError()
+            original = [number(float(v), "original sensor value", -100000, 100000) for v in components]
+        except ValueError:
+            raise RuntimeError("Invalid original emulator sensor value; no injection performed") from None
+        # Restore even when the injection command times out after changing the AVD.
+        try:
+            await self.command("sensor", "set", name, ":".join(map(str, values)))
+            await asyncio.sleep(duration)
+        finally:
+            try:
+                await self.command("sensor", "set", name, ":".join(map(str, original)))
+            except Exception as exc:
+                raise RuntimeError("Emulator sensor restoration failed; test values may remain active") from exc
+
+"""Validated route settings and deterministic, pause-safe motion sampling."""
+from dataclasses import dataclass, asdict
+import math
+import random
+from .gpx import Point, distance_meters, interpolate, offset_point, bearing_radians
+
+
+def route_points(items):
+    if not isinstance(items, list) or not 2 <= len(items) <= 10000:
+        raise ValueError("Route must contain 2 to 10000 nodes")
+    points = []
+    for item in items:
+        lat, lon = float(item["lat"]), float(item["lng"])
+        if not math.isfinite(lat) or not math.isfinite(lon) or not -85 <= lat <= 85 or not -180 <= lon <= 180:
+            raise ValueError("Coordinates out of range (latitude -85..85, longitude -180..180)")
+        points.append(Point(lat, lon))
+    if sum(distance_meters(a, b) for a, b in zip(points, points[1:])) < 0.1:
+        raise ValueError("Route must have a non-zero length")
+    return points
+
+
+@dataclass(frozen=True)
+class Settings:
+    speed_kmh: float = 5.0
+    interval: float = 1.0
+    speed_variation_pct: float = 10.0
+    lateral_variation_m: float = 1.0
+    variation_period: float = 12.0
+    loop: bool = False
+    random_seed: int = 42
+
+    @classmethod
+    def parse(cls, data):
+        if not isinstance(data, dict) or set(data) - set(asdict(cls())):
+            raise ValueError("Unknown settings")
+        values = asdict(cls()) | data
+        for key, low, high in [("speed_kmh", .1, 300), ("interval", .1, 10),
+                               ("speed_variation_pct", 0, 80), ("lateral_variation_m", 0, 20),
+                               ("variation_period", 2, 120)]:
+            value = float(values[key])
+            if not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f"{key} must be within {low}..{high}")
+            values[key] = value
+        if type(values["loop"]) is not bool:
+            raise ValueError("loop must be boolean")
+        seed = values["random_seed"]
+        if type(seed) is not int or not 0 <= seed <= 2147483647:
+            raise ValueError("random_seed must be an integer in 0..2147483647")
+        return cls(**values)
+
+
+class Motion:
+    def __init__(self, points, settings):
+        self.points = points
+        self.lengths = [distance_meters(a, b) for a, b in zip(points, points[1:])]
+        self.total = sum(self.lengths)
+        self.distance = 0.0
+        self.elapsed = 0.0
+        self.laps = 0
+        self.phase = random.Random(settings.random_seed).random() * math.tau
+
+    def advance(self, dt, settings):
+        self.elapsed += dt
+        wave = math.sin(self.elapsed * math.tau / settings.variation_period + self.phase)
+        speed = settings.speed_kmh * (1 + settings.speed_variation_pct / 100 * wave)
+        self.distance += speed / 3.6 * dt
+        done = self.distance >= self.total and not settings.loop
+        if settings.loop:
+            self.laps += int(self.distance / self.total)
+            self.distance %= self.total
+        else:
+            self.distance = min(self.distance, self.total)
+        remaining = self.distance
+        for index, length in enumerate(self.lengths):
+            if remaining <= length and length > 0:
+                fraction = remaining / length
+                a, b = self.points[index:index + 2]
+                point = interpolate(a, b, fraction)
+                # Taper at nodes so corners and endpoints remain on the route.
+                sway = settings.lateral_variation_m * math.sin(self.elapsed * math.tau / settings.variation_period + self.phase) * math.sin(math.pi * fraction)
+                bearing = bearing_radians(a, b)
+                point = offset_point(point, -math.sin(bearing) * sway, math.cos(bearing) * sway)
+                return point, speed, done
+            remaining -= length
+        return self.points[-1], speed, done
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from math import asin, atan2, cos, radians, sin, sqrt
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+
+@dataclass(frozen=True)
+class Point:
+    latitude: float
+    longitude: float
+    timestamp: datetime | None = None
+
+
+EARTH_RADIUS_M = 6_371_000.0
+
+
+def distance_meters(a: Point, b: Point) -> float:
+    """Return the great-circle distance between two GPS points."""
+    lat1, lat2 = radians(a.latitude), radians(b.latitude)
+    dlat = lat2 - lat1
+    dlon = radians(b.longitude - a.longitude)
+    hav = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return 2 * EARTH_RADIUS_M * asin(min(1.0, sqrt(hav)))
+
+
+def interpolate(a: Point, b: Point, fraction: float) -> Point:
+    fraction = max(0.0, min(1.0, fraction))
+    return Point(
+        a.latitude + (b.latitude - a.latitude) * fraction,
+        a.longitude + (b.longitude - a.longitude) * fraction,
+    )
+
+
+def offset_point(point: Point, north_m: float, east_m: float) -> Point:
+    """Move a GPS point by a local north/east offset in meters."""
+    lat_delta = north_m / EARTH_RADIUS_M
+    lon_scale = max(0.01, cos(radians(point.latitude)))
+    lon_delta = east_m / (EARTH_RADIUS_M * lon_scale)
+    return Point(
+        point.latitude + lat_delta * 180 / 3.141592653589793,
+        point.longitude + lon_delta * 180 / 3.141592653589793,
+    )
+
+
+def bearing_radians(a: Point, b: Point) -> float:
+    """Return the initial bearing from a to b in radians."""
+    lat1, lat2 = radians(a.latitude), radians(b.latitude)
+    dlon = radians(b.longitude - a.longitude)
+    return atan2(sin(dlon) * cos(lat2), cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dlon))
+
+
+def load_points(path: str | Path) -> list[Point]:
+    root = ET.parse(path).getroot()
+    points: list[Point] = []
+    for node in root.iter():
+        if node.tag.rsplit("}", 1)[-1] != "trkpt":
+            continue
+        lat, lon = float(node.attrib["lat"]), float(node.attrib["lon"])
+        if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+            raise ValueError(f"Invalid coordinate: {lat}, {lon}")
+        stamp = next((child.text for child in node if child.tag.rsplit("}", 1)[-1] == "time"), None)
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00")) if stamp else None
+        points.append(Point(lat, lon, parsed))
+    if not points:
+        raise ValueError("GPX contains no track points")
+    return points
+
+"""Shared device selection for CLI and local web API."""
+from .android import AndroidDevice, endpoint
+from .device import LocationDevice
+
+
+def create_device(platform="ios", udid=None, rsd_host=None, rsd_port=None, address=None, android_options=None):
+    if platform not in ("ios", "android"):
+        raise ValueError("Platform must be ios or android")
+    if udid is not None and (not isinstance(udid, str) or not udid or len(udid) > 256):
+        raise ValueError("Invalid device identifier")
+    if platform == "android":
+        if rsd_host is not None or rsd_port is not None:
+            raise ValueError("RSD is only supported for iOS")
+        return AndroidDevice(udid, address, android_options)
+    if android_options is not None:
+        raise ValueError("Android test options are only supported for Android")
+    if address:
+        raise ValueError("ADB address is only supported for Android")
+    if (rsd_host is None) != (rsd_port is None):
+        raise ValueError("RSD host and port must be provided together")
+    if rsd_host is not None:
+        endpoint(f"{rsd_host}:{rsd_port}")
+        rsd_host = rsd_host.strip("[]")
+        rsd_port = int(rsd_port)
+    return LocationDevice(udid, rsd_host, rsd_port)
+
+"""Helpers for iPhone location testing."""
+
+__version__ = "0.1.0"
+
+from .cli import main
+
+
+if __name__ == "__main__":
+    main()
