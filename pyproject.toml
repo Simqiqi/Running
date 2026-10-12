@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ios-location-controller"
+version = "0.2.0"
+description = "Local iOS and Android test-device location controller with USB and wireless transports"
+requires-python = ">=3.11"
+dependencies = ["pymobiledevice3>=11.15.5,<12"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "playwright>=1.40,<2"]
+
+[project.scripts]
+ios-location = "ios_location_controller.cli:main"
+ios-location-map = "ios_location_controller.web:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ios_location_controller = ["static/*", "static/images/*"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:xonsh"
+testpaths = ["tests"]
