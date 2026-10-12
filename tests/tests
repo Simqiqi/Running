@@ -1,0 +1,940 @@
+import asyncio
+from unittest.mock import AsyncMock
+
+import pytest
+
+from ios_location_controller import android
+from ios_location_controller.connections import create_device
+from ios_location_controller.gpx import Point
+
+
+@pytest.mark.parametrize('value', ['host;id:5555', '127.0.0.1:0', '127.0.0.1:65536',
+                                 '0.0.0.0:5555', '-s', None, '127.0.0.1:1.5'])
+def test_bad_endpoint(value):
+    with pytest.raises(ValueError):
+        android.endpoint(value)
+
+
+def test_ipv6_and_device_factory():
+    assert android.endpoint('[fd00::1]:1234') == '[fd00::1]:1234'
+    assert isinstance(create_device('android'), android.AndroidDevice)
+    device = create_device(rsd_host='fd00::1', rsd_port=1234)
+    assert device.rsd_port == 1234
+    for options in [{'platform': 'other'}, {'rsd_host': '127.0.0.1'},
+                    {'platform': 'android', 'rsd_port': 1234}, {'address': '127.0.0.1:5555'}]:
+        with pytest.raises(ValueError):
+            create_device(**options)
+
+
+def test_pair_code_is_stdin(monkeypatch):
+    command = AsyncMock()
+    monkeypatch.setattr(android, 'adb', command)
+    asyncio.run(android.pair('192.168.1.2:12345', '123456'))
+    command.assert_awaited_once_with('pair', '192.168.1.2:12345', input_text='123456\n')
+    with pytest.raises(ValueError):
+        asyncio.run(android.pair('192.168.1.2:12345', 'bad;code'))
+
+
+def test_discovery(monkeypatch):
+    monkeypatch.setattr(android, 'adb', AsyncMock(return_value=
+        'List of devices attached\nusb123 device product:test\n192.168.1.2:5555 offline\nabc unauthorized\n'))
+    result = asyncio.run(android.discover())
+    assert len(result) == 3
+    assert result[0]['platform'] == 'android'
+    assert result[2]['type'] == 'ADB / unauthorized'
+
+
+def test_android_lifecycle(monkeypatch):
+    calls = []
+
+    async def command(*args, **kwargs):
+        calls.append(args)
+        if args[-1] == 'get-state':
+            return 'device'
+        if args[-1] == 'help':
+            return 'set-test-provider-location'
+        if args[-1] == 'is-location-enabled':
+            return 'true'
+        if 'get' in args:
+            return 'MOCK_LOCATION: ignore'
+        return ''
+
+    monkeypatch.setattr(android, 'adb', command)
+
+    async def scenario():
+        device = android.AndroidDevice(address='192.168.1.2:5555')
+        await device.connect()
+        await device.set_point(Point(31, 121))
+        assert device.providers == ['gps']
+        await device.clear()
+        assert device.providers == []
+        await device.set_point(Point(32, 122))
+        await device.close()
+        assert device.original_mode is None
+        assert calls[-1][-5:] == ('appops', 'set', 'com.android.shell', 'android:mock_location', 'ignore')
+    asyncio.run(scenario())
+    assert calls[0] == ('connect', '192.168.1.2:5555')
+    assert any('31.00000000,121.00000000' in call for call in calls)
+    assert not any('network' in call for call in calls)
+
+
+@pytest.mark.parametrize('options', [[], {'unexpected': 1}, {'provider': 'fused'},
+    {'gps_accuracy': float('nan')}, {'network_accuracy': float('inf')},
+    {'gps_accuracy': True}, {'network_interval': 0}, {'network_interval': 61},
+    {'gps_accuracy': '5'}, {'network_accuracy': 10001}, {'gps_accuracy': 10 ** 400}])
+def test_invalid_android_options(options):
+    with pytest.raises(ValueError):
+        create_device('android', android_options=options)
+
+
+def test_ios_rejects_android_options():
+    with pytest.raises(ValueError, match='only supported for Android'):
+        create_device(android_options={})
+
+
+def test_independent_provider_accuracy_and_cadence(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(android.time, 'monotonic', lambda: now[0])
+
+    async def scenario():
+        device = android.AndroidDevice('abc', options={'provider':'both', 'gps_accuracy':7,
+            'network_accuracy':80, 'network_interval':5})
+        device.original_mode = 'default'
+        device.shell = AsyncMock(return_value='')
+        await device.set_point(Point(31, 121))
+        assert device.providers == ['gps', 'network']
+        await device.set_route_point(Point(32, 122))
+        diagnostics = device.diagnostics()
+        assert diagnostics['mock'] is True
+        assert diagnostics['sensors'] is False
+        assert diagnostics['raw_gnss'] is False
+        assert diagnostics['injections']['gps']['accuracy_m'] == 7
+        assert diagnostics['injections']['network'] == {'lat':31, 'lng':121, 'accuracy_m':80}
+        now[0] += 5
+        await device.set_route_point(Point(33, 123))
+        assert device.injections['network']['lat'] == 33
+        writes = [c.args for c in device.shell.await_args_list if 'set-test-provider-location' in c.args]
+        assert [c[4] for c in writes] == ['gps', 'network', 'gps', 'gps', 'network']
+        assert writes[0][-1] == '7.0'
+        assert writes[1][-1] == '80.0'
+        await device.clear()
+        assert device.diagnostics()['injections'] == {}
+        await device.set_route_point(Point(34, 124))
+        assert device.injections['network']['lat'] == 34
+    asyncio.run(scenario())
+
+
+def test_network_only_skipped_update_and_manual_override():
+    async def scenario():
+        device = android.AndroidDevice('abc', options={'provider':'network', 'network_interval':60})
+        device.original_mode = 'default'
+        device.shell = AsyncMock(return_value='')
+        assert await device.set_point(Point(31, 121)) is True
+        assert await device.set_route_point(Point(32, 122)) is False
+        assert device.injections['network']['lat'] == 31
+        assert await device.set_point(Point(33, 123)) is True
+        assert device.injections['network']['lat'] == 33
+        assert device.providers == ['network']
+    asyncio.run(scenario())
+
+
+def test_failed_injection_does_not_advance_telemetry():
+    async def scenario():
+        device = android.AndroidDevice('abc')
+        device.original_mode = 'default'
+        device.providers = ['gps']
+        device.shell = AsyncMock(side_effect=RuntimeError('offline'))
+        with pytest.raises(RuntimeError):
+            await device.set_point(Point(31, 121))
+        assert not device.injections
+        assert not device.last_updates
+    asyncio.run(scenario())
+
+
+def test_failed_cleanup_is_retryable():
+    async def scenario():
+        device = android.AndroidDevice('abc')
+        device.providers = ['gps', 'network']
+        device.original_mode = 'default'
+        device.shell = AsyncMock(side_effect=[RuntimeError('offline'), ''])
+        with pytest.raises(RuntimeError, match='cleanup failed'):
+            await device.close()
+        assert device.providers == ['gps']
+        assert device.original_mode == 'default'
+        device.shell = AsyncMock(return_value='')
+        await device.close()
+        assert not device.providers
+        assert device.original_mode is None
+    asyncio.run(scenario())
+
+
+def test_explicit_recovery_clears_existing_providers():
+    async def scenario():
+        device = android.AndroidDevice('abc')
+        device.shell = AsyncMock(return_value='')
+        await device.clear(existing=True)
+        assert device.shell.await_count == 2
+        assert device.providers == []
+    asyncio.run(scenario())
+
+
+def test_unsupported_rom_does_not_change_permissions(monkeypatch):
+    monkeypatch.setattr(android, 'adb', AsyncMock(return_value='device'))
+    device = android.AndroidDevice('abc')
+    device.shell = AsyncMock(return_value='old help')
+    with pytest.raises(RuntimeError, match='lacks ADB'):
+        asyncio.run(device.connect())
+    assert device.original_mode is None
+    assert device.shell.await_count == 1
+
+
+def test_cli_android_options():
+    from ios_location_controller.cli import build_parser
+    args = build_parser().parse_args(['play', 'route.gpx', '--platform', 'android',
+                                     '--address', '192.168.1.2:5555'])
+    assert args.platform == 'android'
+    assert args.address == '192.168.1.2:5555'
+    args = build_parser().parse_args(['play', 'route.gpx', '--platform', 'android',
+        '--android-provider', 'both', '--gps-accuracy', '7', '--network-accuracy', '80',
+        '--network-interval', '6'])
+    assert (args.android_provider, args.gps_accuracy, args.network_accuracy, args.network_interval) == ('both', 7, 80, 6)
+
+
+def test_cli_network_route_sends_endpoint():
+    async def scenario():
+        device = android.AndroidDevice('abc', options={'provider':'network', 'network_interval':60})
+        device.original_mode = 'default'
+        device.shell = AsyncMock(return_value='')
+        points = [Point(31, 121), Point(31.000001, 121), Point(31.000002, 121)]
+        callback = AsyncMock()
+        await device.play(points, .001, speed_kmh=300, on_point=callback)
+        assert device.injections['network']['lat'] == points[-1].latitude
+        assert callback.await_count == 2
+    asyncio.run(scenario())
+
+
+LOCATION_HELP = 'Location service commands:\n  providers\n    set-test-provider-location <PROVIDER>\n'
+
+
+@pytest.mark.parametrize('returncode', [0, -1, 255])
+@pytest.mark.parametrize('supported', [True, False])
+def test_connect_accepts_normal_nonzero_location_help(monkeypatch, returncode, supported):
+    calls = []
+    help_text = LOCATION_HELP if supported else 'Location service commands:\n  help\n'
+
+    async def subprocess(*args, **kwargs):
+        calls.append(args)
+        code, output = 0, ''
+        if args[-1] == 'get-state':
+            output = 'device'
+        elif args[-3:] == ('cmd', 'location', 'help'):
+            code, output = returncode, help_text
+        elif args[-1] == 'is-location-enabled':
+            output = 'true'
+        elif args[-4:] == ('appops', 'get', 'com.android.shell', 'android:mock_location'):
+            output = 'MOCK_LOCATION: ignore'
+        return type('Process', (), {
+            'returncode': code,
+            'communicate': AsyncMock(return_value=(output.encode(), b'')),
+        })()
+
+    monkeypatch.setenv('ADB_PATH', 'adb')
+    monkeypatch.setattr(android.asyncio, 'create_subprocess_exec', subprocess)
+    device = android.AndroidDevice('abc')
+    if supported:
+        asyncio.run(device.connect())
+        assert device.original_mode == 'ignore'
+    else:
+        with pytest.raises(RuntimeError, match='lacks ADB test-provider support'):
+            asyncio.run(device.connect())
+        assert device.original_mode is None
+        assert not any('appops' in call for call in calls)
+
+
+@pytest.mark.parametrize('command, returncode, stdout, stderr', [
+    (('cmd', 'location', 'help'), 1, LOCATION_HELP, ''),
+    (('cmd', 'location', 'help'), 255, 'Unknown command: location', ''),
+    (('cmd', 'location', 'help'), 255, '', ''),
+    (('cmd', 'location', 'help'), 255, LOCATION_HELP, 'error: device unauthorized'),
+    (('cmd', 'location', 'help'), 255, LOCATION_HELP, 'Permission denied'),
+    (('cmd', 'location', 'help'), 0, '', 'SecurityException: permission denied'),
+    (('cmd', 'location', 'help'), 255, LOCATION_HELP + 'Exception occurred', ''),
+    (('cmd', 'location', 'providers', 'add-test-provider', 'gps'), 255, LOCATION_HELP, ''),
+])
+def test_adb_help_exception_does_not_hide_failures(monkeypatch, command, returncode, stdout, stderr):
+    process = type('Process', (), {
+        'returncode': returncode,
+        'communicate': AsyncMock(return_value=(stdout.encode(), stderr.encode())),
+    })()
+    monkeypatch.setenv('ADB_PATH', 'adb')
+    monkeypatch.setattr(android.asyncio, 'create_subprocess_exec', AsyncMock(return_value=process))
+    with pytest.raises(RuntimeError):
+        asyncio.run(android.adb('-s', 'abc', 'shell', *command))
+
+
+def test_adb_subprocess_cancellation(monkeypatch):
+    class Process:
+        returncode = None
+        killed = False
+
+        async def communicate(self, data=None):
+            if not self.killed:
+                await asyncio.sleep(100)
+            return b'', b''
+
+        def kill(self):
+            self.killed = True
+
+    process = Process()
+    monkeypatch.setattr(android.shutil, 'which', lambda _: 'adb')
+    monkeypatch.setattr(android.asyncio, 'create_subprocess_exec', AsyncMock(return_value=process))
+
+    async def scenario():
+        task = asyncio.create_task(android.adb('devices'))
+        await asyncio.sleep(.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert process.killed
+    asyncio.run(scenario())
+
+import asyncio
+import time
+import pytest
+from ios_location_controller.playback import PlaybackController
+
+class FakeDevice:
+    sent=[]
+    def __init__(self, **kwargs): pass
+    async def connect(self): pass
+    async def close(self): pass
+    async def clear(self): pass
+    async def set_point(self,point): self.sent.append(point)
+
+def test_lifecycle_and_persistence(tmp_path):
+    c=PlaybackController(tmp_path/'session.json',FakeDevice)
+    route={"name":"test","points":[{"lat":31.23,"lng":121.47},{"lat":31.24,"lng":121.48}]}
+    try:
+        with pytest.raises(ValueError): c.call('start')
+        c.call('route',route)
+        assert c.status()['current'] is None
+        c.call('settings',{'interval':.1})
+        c.call('connect')
+        assert c.status()['current']==route['points'][0]
+        c.call('position', {'lat': 35.0, 'lng': 139.0})
+        assert c.status()['current']=={'lat': 35.0, 'lng': 139.0}
+        c.call('start'); time.sleep(.35)
+        c.call('pause')
+        paused=c.status()
+        time.sleep(.4)
+        assert c.status()['current']==paused['current']
+        assert c.status()['elapsed_s']==paused['elapsed_s']
+        with pytest.raises(ValueError): c.call('route',route)
+        c.call('start'); time.sleep(.2); c.call('pause')
+        assert 0 < c.status()['elapsed_s']-paused['elapsed_s'] < .4
+        c.call('stop'); assert c.status()['current'] is None
+        c.call('disconnect'); assert not c.status()['connected']
+    finally: c.close()
+    restored=PlaybackController(tmp_path/'session.json',FakeDevice)
+    try:
+        assert restored.status()['route']==route
+        assert restored.status()['settings']['interval']==.1
+        assert restored.status()['state']=='idle'
+        assert restored.status()['current'] is None
+    finally: restored.close()
+
+
+def test_platform_options_and_failed_cleanup(tmp_path):
+    options = []
+
+    class Device(FakeDevice):
+        fail_close = False
+
+        def __init__(self, **kwargs):
+            options.append(kwargs)
+            self.udid = 'wifi-phone'
+
+        async def close(self):
+            if self.fail_close:
+                raise RuntimeError('offline during cleanup')
+
+    controller = PlaybackController(tmp_path/'wireless.json', Device)
+    try:
+        result = controller.call('connect', {'platform':'android', 'address':'192.168.1.2:5555'})
+        assert result['platform'] == 'android'
+        assert result['udid'] == 'wifi-phone'
+        assert options[0]['address'] == '192.168.1.2:5555'
+        controller.device.fail_close = True
+        with pytest.raises(RuntimeError, match='cleanup'):
+            controller.call('disconnect')
+        assert controller.status()['connected']
+        controller.device.fail_close = False
+        controller.call('disconnect')
+        controller.call('connect', {'platform':'ios', 'rsd_host':'fd00::1', 'rsd_port':1234})
+        assert options[-1]['rsd_host'] == 'fd00::1'
+        assert options[-1]['rsd_port'] == 1234
+        assert controller.status()['connected']
+    finally:
+        controller.close()
+
+
+def test_clear_loaded_route_stops_and_persists(tmp_path):
+    class Device(FakeDevice):
+        clears = 0
+
+        async def clear(self):
+            self.clears += 1
+
+    path = tmp_path / 'session.json'
+    controller = PlaybackController(path, Device)
+    points = [{'lat':31.23,'lng':121.47}, {'lat':31.24,'lng':121.48}]
+    try:
+        controller.call('route', {'name':'saved', 'points':points})
+        controller.call('connect')
+        controller.call('start')
+        result = controller.call('clear-route')
+        assert result['route'] == {'name':'', 'points':[]}
+        assert result['state'] == 'ready'
+        assert result['current'] is None
+        assert result['total_m'] == 0
+        assert controller.device.clears == 1
+        with pytest.raises(ValueError):
+            controller.call('start')
+    finally:
+        controller.close()
+    restored = PlaybackController(path, Device)
+    try:
+        assert restored.status()['route'] == {'name':'', 'points':[]}
+    finally:
+        restored.close()
+
+
+def test_clear_loaded_route_keeps_route_on_device_failure(tmp_path):
+    class Device(FakeDevice):
+        async def clear(self):
+            raise RuntimeError('device offline')
+
+    controller = PlaybackController(tmp_path/'session.json', Device)
+    points = [{'lat':31.23,'lng':121.47}, {'lat':31.24,'lng':121.48}]
+    try:
+        controller.call('route', {'name':'saved', 'points':points})
+        controller.call('connect')
+        with pytest.raises(RuntimeError, match='device offline'):
+            controller.call('clear-route')
+        assert controller.status()['route']['points'] == points
+    finally:
+        controller.close()
+
+
+def test_network_telemetry_reports_only_successful_updates(tmp_path):
+    from unittest.mock import AsyncMock
+    from ios_location_controller.android import AndroidDevice
+
+    options = []
+
+    def factory(**kwargs):
+        options.append(kwargs['android_options'])
+        device = AndroidDevice('test', options=kwargs['android_options'])
+        device.original_mode = 'default'
+        device.connect = AsyncMock()
+        device.shell = AsyncMock(return_value='')
+        return device
+
+    controller = PlaybackController(tmp_path/'network.json', factory)
+    config = {'provider':'network', 'network_interval':60, 'network_accuracy':90}
+    try:
+        controller.call('route', {'points':[{'lat':31,'lng':121}, {'lat':32,'lng':122}]})
+        controller.call('settings', {'interval':.1})
+        result = controller.call('connect', {'platform':'android', 'android_options':config})
+        assert options == [config]
+        assert result['diagnostics']['mock'] is True
+        assert result['diagnostics']['injections']['network']['accuracy_m'] == 90
+        controller.call('start')
+        time.sleep(.25)
+        result = controller.call('pause')
+        assert result['distance_m'] > 0
+        assert result['current'] == {'lat':31,'lng':121}
+        result = controller.call('position', {'lat':33, 'lng':123})
+        assert result['current'] == {'lat':33,'lng':123}
+        assert result['diagnostics']['injections']['network']['lat'] == 33
+        result = controller.call('stop')
+        assert result['diagnostics']['injections'] == {}
+        result = controller.call('disconnect')
+        assert result['diagnostics'] is None
+    finally:
+        controller.close()
+
+import asyncio
+from unittest.mock import AsyncMock
+
+import pytest
+
+from ios_location_controller import emulator
+from ios_location_controller.cli import build_parser, run
+
+
+@pytest.mark.parametrize("serial", [None, "device123", "192.168.1.1:5555", "emulator-0",
+                                   "emulator-65536", "emulator-5554;id"])
+def test_requires_emulator_serial(serial):
+    with pytest.raises(ValueError):
+        emulator.Emulator(serial)
+
+
+def test_gps_fix_order_and_units(monkeypatch):
+    command = AsyncMock(side_effect=['device', 'Test_AVD\nOK', 'OK'])
+    monkeypatch.setattr(emulator, 'adb', command)
+    asyncio.run(emulator.Emulator('emulator-5554').fix(31, 121, 20, 9, 18.52))
+    assert command.await_args.args == ('-s', 'emulator-5554', 'emu', 'geo', 'fix',
+                                      '121.0', '31.0', '20.0', '9', '10.0')
+
+
+@pytest.mark.parametrize('options', [{'latitude':float('nan')}, {'longitude':181},
+    {'altitude':float('inf')}, {'satellites':0}, {'satellites':13}, {'satellites':True},
+    {'speed_kmh':-1}, {'latitude':10 ** 400}])
+def test_invalid_fix_does_not_touch_device(monkeypatch, options):
+    command = AsyncMock()
+    monkeypatch.setattr(emulator, 'adb', command)
+    with pytest.raises(ValueError):
+        asyncio.run(emulator.Emulator('emulator-5554').fix(**({'latitude':31,'longitude':121} | options)))
+    command.assert_not_awaited()
+
+
+@pytest.mark.parametrize('response', ['KO: unknown sensor', 'OK', 'gyroscope = 1:2',
+                                    'gyroscope = nan:0:0'])
+def test_sensor_requires_readable_original_values(monkeypatch, response):
+    command = AsyncMock(side_effect=['device', 'Test_AVD\nOK', response])
+    monkeypatch.setattr(emulator, 'adb', command)
+    with pytest.raises(RuntimeError):
+        asyncio.run(emulator.Emulator('emulator-5554').sensor('gyroscope', 1, 2, 3))
+    assert not any('set' in c.args for c in command.await_args_list)
+
+
+def test_sensor_restored_after_normal_completion(monkeypatch):
+    command = AsyncMock(side_effect=['device', 'Test_AVD\nOK', 'gyroscope = 0:1e-3:-0.1\nOK', 'OK', 'OK'])
+    monkeypatch.setattr(emulator, 'adb', command)
+    asyncio.run(emulator.Emulator('emulator-5554').sensor('gyroscope', .1, .2, .3, .1))
+    assert command.await_args_list[-2].args[-2:] == ('gyroscope', '0.1:0.2:0.3')
+    assert command.await_args.args[-2:] == ('gyroscope', '0.0:0.001:-0.1')
+
+
+def test_sensor_restored_on_cancellation(monkeypatch):
+    injected = asyncio.Event()
+    calls = []
+
+    async def command(*args):
+        calls.append(args)
+        if args[-1] == 'get-state':
+            return 'device'
+        if args[-2:] == ('avd', 'name'):
+            return 'Test_AVD\nOK'
+        if 'get' in args:
+            return 'acceleration = 0:0:9.8\nOK'
+        injected.set()
+        return 'OK'
+
+    monkeypatch.setattr(emulator, 'adb', command)
+
+    async def scenario():
+        task = asyncio.create_task(emulator.Emulator('emulator-5554').sensor('acceleration', 1, 2, 3, 60))
+        await injected.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert calls[-1][-2:] == ('acceleration', '0.0:0.0:9.8')
+    asyncio.run(scenario())
+
+
+def test_failed_sensor_write_attempts_restoration(monkeypatch):
+    command = AsyncMock(side_effect=['device', 'Test_AVD\nOK', 'gyroscope = 0:0:0\nOK',
+                                    RuntimeError('timeout'), 'OK'])
+    monkeypatch.setattr(emulator, 'adb', command)
+    with pytest.raises(RuntimeError, match='timeout'):
+        asyncio.run(emulator.Emulator('emulator-5554').sensor('gyroscope', 1, 2, 3))
+    assert command.await_args.args[-1] == '0.0:0.0:0.0'
+
+
+def test_cli_emulator_fix(monkeypatch, capsys):
+    command = AsyncMock(side_effect=['device', 'Test_AVD\nOK', 'OK'])
+    monkeypatch.setattr(emulator, 'adb', command)
+    args = build_parser().parse_args(['emulator', '--serial', 'emulator-5554', 'fix',
+                                     '--latitude', '31', '--longitude', '121', '--satellites', '9'])
+    asyncio.run(run(args))
+    assert 'not raw GNSS' in capsys.readouterr().out
+
+
+def test_offline_emulator_cannot_inject(monkeypatch):
+    command = AsyncMock(return_value='offline')
+    monkeypatch.setattr(emulator, 'adb', command)
+    with pytest.raises(RuntimeError, match='offline'):
+        asyncio.run(emulator.Emulator('emulator-5554').fix(31, 121))
+    assert command.await_count == 1
+
+
+def test_restore_failure_is_not_reported_as_success(monkeypatch):
+    command = AsyncMock(side_effect=['device', 'Test_AVD\nOK', 'gyroscope = 0:0:0\nOK',
+                                    'OK', RuntimeError('offline')])
+    monkeypatch.setattr(emulator, 'adb', command)
+    with pytest.raises(RuntimeError, match='restoration failed'):
+        asyncio.run(emulator.Emulator('emulator-5554').sensor('gyroscope', 1, 2, 3, .1))
+
+
+@pytest.mark.parametrize('options', [{'name':'unknown'}, {'x':float('nan')}, {'duration':0},
+                                   {'duration':61}, {'z':True}])
+def test_sensor_validation_happens_before_device_io(monkeypatch, options):
+    command = AsyncMock()
+    monkeypatch.setattr(emulator, 'adb', command)
+    values = {'name':'gyroscope', 'x':1, 'y':2, 'z':3} | options
+    with pytest.raises(ValueError):
+        asyncio.run(emulator.Emulator('emulator-5554').sensor(**values))
+    command.assert_not_awaited()
+
+"""Headless connection-form smoke test; never touches a physical device."""
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from threading import Thread
+
+from playwright.sync_api import sync_playwright, expect
+
+from ios_location_controller.web import Handler
+from ios_location_controller.motion import Settings
+from dataclasses import asdict
+
+
+class Controller:
+    def __init__(self):
+        self.calls = []
+        self.route = {'name':'', 'points':[]}
+
+    def status(self):
+        return dict(state='idle', connected=False, udid=None, devices=[],
+                    discovery_error=None, error=None, wda_error=None,
+                    route=self.route, settings=asdict(Settings()),
+                    real_current=None, current=None, speed_kmh=0,
+                    total_m=0, distance_m=0, elapsed_s=0, laps=0)
+
+    def call(self, action, data):
+        self.calls.append((action, data))
+        if action == 'route':
+            self.route = {'name':data['name'], 'points':data['points']}
+        elif action == 'clear-route':
+            self.route = {'name':'', 'points':[]}
+        return self.status()
+
+
+def main():
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server.controller = Controller()
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(channel='msedge', headless=True)
+            page = browser.new_page(viewport={'width':1440, 'height':1000})
+            errors = []
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            page.route('https://*.tile.openstreetmap.org/**', lambda route: route.abort())
+            page.goto(f'http://127.0.0.1:{server.server_port}')
+            page.locator('#tab-player').click()
+            expect(page.locator('#connect')).to_be_disabled()
+            assert page.evaluate("""async () => {
+              const response = await fetch('/api/route', {method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({name:'browser',points:[
+                  {lat:31.23,lng:121.47},{lat:31.24,lng:121.48}]})});
+              return response.ok;
+            }""")
+            expect(page.locator('#clear-loaded-route')).to_be_enabled()
+            page.locator('#clear-loaded-route').click()
+            expect(page.locator('#clear-loaded-route')).to_be_disabled()
+            expect(page.locator('#loaded-route')).to_have_text('未载入路线')
+            assert server.controller.calls[-1] == ('clear-route', {})
+            page.locator('#transport').select_option('wireless')
+            expect(page.locator('#ios-wireless')).to_be_visible()
+            expect(page.locator('#connect')).to_be_enabled()
+            page.locator('#rsd-host').fill('fd00::1')
+            page.locator('#rsd-port').fill('1234')
+            page.locator('#connect').click()
+            expect(page.locator('#connect')).to_be_enabled()
+            assert server.controller.calls[-1] == ('connect', {
+                'platform':'ios', 'rsd_host':'fd00::1', 'rsd_port':1234})
+            page.locator('#platform').select_option('android')
+            expect(page.locator('#android-wireless')).to_be_visible()
+            expect(page.locator('#ios-wireless')).to_be_hidden()
+            expect(page.locator('#android-test-options')).to_be_visible()
+            page.locator('#android-provider').select_option('both')
+            page.locator('#gps-accuracy').fill('7')
+            page.locator('#network-accuracy').fill('80')
+            page.locator('#adb-address').fill('192.168.1.2:5555')
+            page.locator('#android-wireless summary').click()
+            page.locator('#pair-address').fill('192.168.1.2:12345')
+            page.locator('#pair-code').fill('123456')
+            page.locator('#pair-device').click()
+            expect(page.locator('#pair-device')).to_be_enabled()
+            expect(page.locator('#pair-code')).to_have_value('')
+            assert server.controller.calls[-1] == ('pair', {
+                'address':'192.168.1.2:12345', 'code':'123456'})
+            page.locator('#connect').click()
+            expect(page.locator('#connect')).to_be_enabled()
+            assert server.controller.calls[-1] == ('connect', {
+                'platform':'android', 'address':'192.168.1.2:5555',
+                'android_options':{'provider':'both', 'gps_accuracy':7,
+                                   'network_accuracy':80, 'network_interval':5}})
+            page.set_viewport_size({'width':390, 'height':844})
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            Path('artifacts').mkdir(exist_ok=True)
+            page.screenshot(path='artifacts/wireless-mobile.png', full_page=True)
+            assert not errors, errors
+            browser.close()
+        print('PASS: route clearing, iOS RSD, Android pairing/connect, code clearing, mobile layout')
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+if __name__ == '__main__':
+    main()
+
+"""Real Edge UI checks. Does not connect to or change a physical iPhone."""
+from pathlib import Path
+from playwright.sync_api import sync_playwright, expect
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / 'artifacts'
+OUT.mkdir(exist_ok=True)
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(channel='msedge', headless=True)
+    context = browser.new_context(viewport={'width':1440,'height':1000}, accept_downloads=True,
+                                  record_video_dir=str(OUT/'video'))
+    page = context.new_page()
+    errors=[]
+    page.on('pageerror',lambda e:errors.append(str(e)))
+    page.goto('http://127.0.0.1:8765',wait_until='domcontentloaded')
+    expect(page.locator('#service')).to_have_text('本地服务已连接')
+    page.locator('#map').click(position={'x':250,'y':250})
+    page.locator('#map').click(position={'x':380,'y':280})
+    page.locator('#map').click(position={'x':480,'y':390})
+    expect(page.locator('#node-count')).to_have_text('3')
+    expect(page.locator('.node-icon')).to_have_count(3)
+    page.locator('#undo').click()
+    expect(page.locator('#node-count')).to_have_text('2')
+    page.locator('#map').click(position={'x':480,'y':390})
+    marker=page.locator('.node-icon').first.bounding_box()
+    page.mouse.move(marker['x']+14,marker['y']+14)
+    page.mouse.down();page.mouse.move(marker['x']+55,marker['y']+35,steps=8);page.mouse.up()
+    page.locator('#route-name').fill('browser-test-route')
+    with page.expect_download() as download:
+        page.locator('#export').click()
+    path=OUT/'browser-test-route.gpx'
+    download.value.save_as(path)
+    assert path.read_text().count('<trkpt')==3
+    page.locator('#clear').click()
+    expect(page.locator('#node-count')).to_have_text('0')
+    page.locator('#editor-file').set_input_files(path)
+    expect(page.locator('#node-count')).to_have_text('3')
+    page.locator('#fit').click()
+    page.wait_for_function("document.querySelectorAll('.leaflet-tile-loaded').length > 0",timeout=30000)
+    page.wait_for_timeout(1200)
+    page.screenshot(path=str(OUT/'route-editor.png'))
+    page.reload(wait_until='domcontentloaded')
+    expect(page.locator('#node-count')).to_have_text('3')
+    page.locator('#tab-player').click()
+    page.locator('#player-file').set_input_files(path)
+    expect(page.locator('#loaded-route')).to_contain_text('3 节点')
+    page.locator('#pace').fill('6')
+    expect(page.locator('#speed')).to_have_value('10')
+    page.locator('[name=speed_variation_pct]').fill('20')
+    page.locator('#apply').click()
+    expect(page.locator('#message')).to_contain_text('参数已保存')
+    assert page.request.get('http://127.0.0.1:8765/api/status').json()['settings']['speed_kmh']==10
+    page.screenshot(path=str(OUT/'playback-panel.png'))
+    page.locator('#tab-editor').click()
+    page.locator('#use-route').click()
+    expect(page.locator('#player-panel')).to_be_visible()
+    expect(page.locator('#loaded-route')).to_contain_text('3 节点')
+    page.set_viewport_size({'width':390,'height':844})
+    page.screenshot(path=str(OUT/'mobile.png'),full_page=True)
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+    assert not errors, errors
+    context.close(); browser.close()
+    print('PASS: real map clicks, numbered nodes, dragging, undo, clear, GPX roundtrip, reload persistence, playback import, speed/pace, parameter save, mobile layout; no JS errors')
+
+"""Opt-in real iPhone smoke test: short playback, then clear simulation."""
+from pathlib import Path
+from playwright.sync_api import sync_playwright, expect
+
+ROOT=Path(__file__).resolve().parents[1]
+OUT=ROOT/'artifacts'
+with sync_playwright() as p:
+    browser=p.chromium.launch(channel='msedge',headless=True)
+    context=browser.new_context(viewport={'width':1440,'height':1100},record_video_dir=str(OUT/'device-video'))
+    page=context.new_page()
+    errors=[]
+    page.on('pageerror',lambda e:errors.append(str(e)))
+    page.goto('http://127.0.0.1:8765',wait_until='domcontentloaded')
+    page.locator('#tab-player').click()
+    page.locator('#player-file').set_input_files(ROOT/'routes/sample.gpx')
+    expect(page.locator('#loaded-route')).to_contain_text('sample',timeout=10000)
+    expect(page.locator('#connect')).to_be_enabled(timeout=15000)
+    try:
+        page.locator('#connect').click()
+        expect(page.locator('#device-state')).to_have_text('定位服务已连接',timeout=40000)
+        expect(page.locator('#position')).to_contain_text('31.230400',timeout=10000)
+        page.locator('#speed').fill('5')
+        page.locator('[name=interval]').fill('0.2')
+        page.locator('#start').click()
+        expect(page.locator('#play-state')).to_have_text('正在移动',timeout=15000)
+        page.wait_for_timeout(1500)
+        page.locator('#pause').click()
+        expect(page.locator('#play-state')).to_have_text('已暂停')
+        paused=page.request.get('http://127.0.0.1:8765/api/status').json()
+        page.wait_for_timeout(1000)
+        again=page.request.get('http://127.0.0.1:8765/api/status').json()
+        assert paused['current']==again['current']
+        assert paused['current']['lat']!=31.2304
+        page.locator('#speed').fill('6')
+        page.locator('#start').click()
+        expect(page.locator('#play-state')).to_have_text('正在移动')
+        page.wait_for_timeout(600)
+        page.locator('#pause').click()
+        expect(page.locator('#play-state')).to_have_text('已暂停')
+        page.screenshot(path=str(OUT/'device-paused.png'))
+        page.locator('#stop').click()
+        expect(page.locator('#position')).to_have_text('尚未发送模拟坐标')
+        page.locator('#disconnect').click()
+        expect(page.locator('#device-state')).to_have_text('尚未连接定位服务')
+        assert not errors,errors
+        print('PASS: physical iPhone DVT connection, route start, start, pause freezes coordinates, parameter change, resume, stop/clear, disconnect')
+    finally:
+        page.request.post('http://127.0.0.1:8765/api/stop',data={})
+        page.request.post('http://127.0.0.1:8765/api/disconnect',data={})
+        print('TILES',page.locator('.leaflet-tile-loaded').count())
+        print('MAP ERRORS',page.locator('#map-warning').text_content())
+        context.close();browser.close()
+
+import json
+from http.server import ThreadingHTTPServer
+from threading import Thread
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+import pytest
+from ios_location_controller.web import Handler
+
+@pytest.fixture
+def server():
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    thread=Thread(target=server.serve_forever,daemon=True);thread.start()
+    yield f'http://127.0.0.1:{server.server_port}'
+    server.shutdown();server.server_close();thread.join()
+
+def test_static_and_health(server):
+    for path in ['/','/static/app.js','/static/app.css','/static/leaflet.js']:
+        with urlopen(server+path) as r:
+            assert r.status==200 and r.headers['Cache-Control']=='no-store'
+    assert json.load(urlopen(server+'/api/health'))['version']=='2.0'
+    with pytest.raises(HTTPError) as exc: urlopen(server+'/static/../../README.md')
+    assert exc.value.code==404
+
+def test_bad_import_and_origin(server):
+    request=Request(server+'/api/import',data=b'{"gpx":"<gpx/>"}',headers={'Content-Type':'application/json'})
+    with pytest.raises(HTTPError) as exc: urlopen(request)
+    assert exc.value.code==400
+    request.add_header('Origin','http://untrusted.invalid')
+    with pytest.raises(HTTPError) as exc: urlopen(request)
+    assert exc.value.code==403
+
+def test_foreign_host_is_rejected_for_all_methods(server):
+    for path in ['/api/status', '/api/health', '/', '/static/app.js']:
+        request=Request(server+path,headers={'Host':'attacker.invalid'})
+        with pytest.raises(HTTPError) as exc: urlopen(request)
+        assert exc.value.code==403
+    request=Request(server+'/api/import',data=b'{}',headers={
+        'Content-Type':'application/json','Host':'attacker.invalid'})
+    with pytest.raises(HTTPError) as exc: urlopen(request)
+    assert exc.value.code==403
+
+def test_gpx_import(server):
+    body=json.dumps({'gpx':'<gpx><trk><trkseg><trkpt lat="31" lon="121"/><trkpt lat="32" lon="121"/></trkseg></trk></gpx>'}).encode()
+    result=json.load(urlopen(Request(server+'/api/import',data=body,headers={'Content-Type':'application/json'})))
+    assert len(result['points'])==2
+
+import math
+import pytest
+from ios_location_controller.motion import Settings, Motion, route_points
+from ios_location_controller.gpx import distance_meters
+from ios_location_controller.web import parse_gpx
+
+ROUTE = [{"lat":31.2304,"lng":121.4737},{"lat":31.2308,"lng":121.4742}]
+
+@pytest.mark.parametrize('data', [{"speed_kmh":0},{"interval":float('nan')},{"lateral_variation_m":-1},{"speed_variation_pct":81},{"loop":"false"},{"random_seed":1.2},{"extra":1}])
+def test_invalid_settings(data):
+    with pytest.raises(ValueError): Settings.parse(data)
+
+@pytest.mark.parametrize('points', [[],ROUTE[:1],[ROUTE[0],ROUTE[0]],[{"lat":float('nan'),"lng":0},ROUTE[1]],[{"lat":91,"lng":0},ROUTE[1]]])
+def test_invalid_routes(points):
+    with pytest.raises(ValueError): route_points(points)
+
+def test_motion_repeatability_and_bounds():
+    settings=Settings()
+    points=route_points(ROUTE)
+    a,b=Motion(points,settings),Motion(points,settings)
+    for _ in range(10):
+        result=a.advance(.5,settings)
+        assert result==b.advance(.5,settings)
+        assert 4.5 <= result[1] <= 5.5
+    assert a.elapsed==5
+
+def test_end_and_loop():
+    points=route_points(ROUTE)
+    settings=Settings(speed_variation_pct=0,lateral_variation_m=0)
+    m=Motion(points,settings)
+    p,_,done=m.advance(1000,settings)
+    assert done and distance_meters(p,points[-1])<.001
+    m=Motion(points,settings)
+    assert not m.advance(1000,Settings(loop=True))[2]
+    assert m.laps>0
+
+def test_gpx_validation():
+    assert len(parse_gpx('<gpx><rte><rtept lat="1" lon="2"/><rtept lat="1.1" lon="2"/></rte></gpx>'))==2
+    for text in ['<gpx/>','<!DOCTYPE x><gpx/>','<gpx><trkpt lat="nan" lon="0"/></gpx>']:
+        with pytest.raises(ValueError): parse_gpx(text)
+
+"""Map centering regression with mocked status; no physical phone writes."""
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(channel='msedge', headless=True)
+    page = browser.new_page()
+    page.goto('http://127.0.0.1:8765')
+    page.wait_for_function('initialized')
+    page.evaluate('''() => {
+      const data = structuredClone(status);
+      data.connected = false; data.current = null; renderStatus(structuredClone(data));
+      map.setView([0, 0], 4);
+      data.connected = true; data.udid = 'test';
+      data.current = {lat: 39.9, lng: 116.4}; renderStatus(structuredClone(data));
+      if (map.distance(map.getCenter(), [39.9, 116.4]) > 2) throw Error('not centered: ' + JSON.stringify(map.getCenter()));
+      if (map.getZoom() < 17) throw Error('not zoomed');
+      map.setView([0, 0], 4, {animate:false}); renderStatus(structuredClone(data));
+      if (map.distance(map.getCenter(), [0, 0]) > 1) throw Error('poll stole viewport');
+      document.getElementById('locate-phone').click();
+      if (map.distance(map.getCenter(), [39.9, 116.4]) > 1) throw Error('button failed');
+      data.connected = false; data.current = null; renderStatus(structuredClone(data));
+      map.setView([0, 0], 4, {animate:false});
+      data.connected = true; renderStatus(structuredClone(data));
+      if (map.distance(map.getCenter(), [0, 0]) > 1) throw Error('invented GPS');
+      document.getElementById('locate-phone').click();
+      if (!document.getElementById('message').textContent.includes('GPS')) throw Error('missing limitation');
+    }''')
+    browser.close()
+    print('PASS: connection centers, polling preserves pan, locate button, no-coordinate fallback')
+
+from pathlib import Path
+from ios_location_controller.gpx import load_points
+
+def test_sample_route_loads() -> None:
+    path = Path(__file__).parents[1] / "routes" / "sample.gpx"
+    points = load_points(path)
+    assert len(points) == 3
+    assert points[0].latitude == 31.2304
